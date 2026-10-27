@@ -1,0 +1,104 @@
+name: "Genesys Terraform Direct Push Pipeline"
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+
+jobs:
+  terraform:
+    name: "Direct Push Deployment (dev)"
+    runs-on: ubuntu-latest
+
+    env:
+      GENESYSCLOUD_OAUTHCLIENT_ID: ${{ secrets.GENESYSCLOUD_OAUTHCLIENT_ID }}
+      GENESYSCLOUD_OAUTHCLIENT_SECRET: ${{ secrets.GENESYSCLOUD_OAUTHCLIENT_SECRET }}
+      GENESYSCLOUD_REGION: ${{ secrets.GENESYSCLOUD_REGION }}
+      TF_IN_AUTOMATION: "true"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history so every commit in the push can be compared
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Detect Added or Modified Resources
+        id: detect
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          # Compare against the commit before this push (covers multi-commit pushes).
+          # Fall back to HEAD~1 for new branches, where "before" is all zeros.
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            BEFORE_SHA="HEAD~1"
+          fi
+
+          # Only Added (A) or Modified (M) files. Deleted .tf files are ignored on
+          # purpose, so removing a file never removes an object from Genesys.
+          CHANGED_FILES=$(git diff --name-only --diff-filter=AM "$BEFORE_SHA" HEAD | grep '\.tf$' || true)
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No added or modified .tf files in this push."
+            echo "targets=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Detected changed files:"
+          echo "$CHANGED_FILES"
+
+          TARGET_ARGS=""
+          for FILE in $CHANGED_FILES; do
+            while IFS= read -r line; do
+              TYPE=$(echo "$line" | awk -F'"' '{print $2}')
+              NAME=$(echo "$line" | awk -F'"' '{print $4}')
+
+              if [[ "$FILE" =~ ^modules/([^/]+)/ ]]; then
+                TARGET="module.${BASH_REMATCH[1]}.${TYPE}.${NAME}"
+              else
+                TARGET="${TYPE}.${NAME}"
+              fi
+
+              TARGET_ARGS="$TARGET_ARGS -target=$TARGET"
+            done < <(grep -E '^[[:space:]]*resource[[:space:]]+"[^"]+"[[:space:]]+"[^"]+"' "$FILE")
+          done
+
+          echo "Calculated dynamic targets: $TARGET_ARGS"
+          echo "targets=$TARGET_ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan
+        if: steps.detect.outputs.targets != ''
+        run: terraform plan -input=false ${{ steps.detect.outputs.targets }} -out=tfplan
+
+      - name: Block Deletes and Replacements
+        if: steps.detect.outputs.targets != ''
+        run: |
+          terraform show -json tfplan > tfplan.json
+          DESTRUCTIVE=$(jq -r '
+            .resource_changes[]?
+            | select(.change.actions | index("delete"))
+            | "\(.address) -> \(.change.actions | join("/"))"' tfplan.json)
+
+          if [ -n "$DESTRUCTIVE" ]; then
+            echo "::error::Plan would delete or replace existing Genesys objects. Aborting."
+            echo "$DESTRUCTIVE"
+            exit 1
+          fi
+
+          echo "Plan summary (no deletes):"
+          jq -r '.resource_changes[]? | select(.change.actions != ["no-op"])
+                 | "  \(.change.actions | join("/")): \(.address)"' tfplan.json
+
+      - name: Terraform Apply
+        if: steps.detect.outputs.targets != ''
+        run: terraform apply -input=false tfplan
